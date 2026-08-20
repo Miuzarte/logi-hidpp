@@ -7,17 +7,18 @@ import (
 
 // HID++ 2.0 协议常量
 const (
-	reportIDShort     = 0x10
-	reportIDLong      = 0x11
-	featureIRoot      = 0x0000
-	featureButtonSpy  = 0x8110
-	swid              = 0x0A
-	funcGetFeature    = 0x00
-	funcStartSpy      = 0x01
-	funcStopSpy       = 0x02
-	eventButton       = 0x00
-	errFeatureIndex   = 0x8F
-	hidpStatusSuccess = 0x00110000
+	reportIDShort      = 0x10
+	reportIDLong       = 0x11
+	featureIRoot       = 0x0000
+	featureButtonSpy   = 0x8110
+	swid               = 0x0A
+	funcGetFeature     = 0x00
+	funcGetFeatureList = 0x02
+	funcStartSpy       = 0x01
+	funcStopSpy        = 0x02
+	eventButton        = 0x00
+	errFeatureIndex    = 0x8F
+	hidpStatusSuccess  = 0x00110000
 )
 
 var (

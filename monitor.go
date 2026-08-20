@@ -36,6 +36,12 @@ type Event struct {
 	Pressed bool
 }
 
+// FeatureInfo 是 IRoot.getFeatureList 返回的一条 feature (索引 + ID)
+type FeatureInfo struct {
+	Index uint8
+	ID    uint16
+}
+
 // device 是平台无关的 HID++ 设备接口, Windows 实现见 hid_windows.go
 type device interface {
 	FeatureIndex(ctx context.Context) (uint8, error)
@@ -51,13 +57,39 @@ var (
 		return nil, ErrUnsupported
 	}
 
+	// startNotifier 由平台实现注入: 创建设备插拔通知源, 无通知源返回 (nil, nil)
+	startNotifier = func() (deviceNotifier, error) {
+		return startDeviceNotifier()
+	}
+
 	ErrUnsupported = errors.New("logihidpp: unsupported platform")
 	ErrNoDevice    = errors.New("logihidpp: no Logitech HID++ mouse with feature 0x8110")
 
 	retryDelay     = 2 * time.Second
 	reconnectDelay = time.Second
 	learnTimeout   = 2 * time.Second
+
+	// readPollInterval 是阻塞读的检查间隔: 读报告带这个超时, 超时后检查
+	// 首报告状态与设备插拔事件
+	readPollInterval = 2 * time.Second
+	// readIdleTimeout 是首报告兜底超时: 连接建立后从未收到任何报告且超过
+	// 该时长才重连 (纯兜底, 用于极端 ghost 场景)
+	// 注意: 0x8110 空闲时正常不发报告, 所以正常设备不应频繁触发;
+	// 鼠标休眠/接收器重枚举的重连由设备插拔事件 (notify) 即时驱动
+	readIdleTimeout = 5 * time.Minute
 )
+
+// Logf 是诊断日志回调 (默认空操作), 由宿主扩展 (mhub-logi) 设置,
+// 用于排查连接/事件链路: 连接失败、重连、未匹配报告等
+var Logf = func(format string, args ...any) {}
+
+// deviceNotifier 监听 Windows HID 设备接口插拔事件 (WM_DEVICECHANGE),
+// 接收器重枚举/鼠标休眠唤醒时立即触发重连, 不等 10s 静默看门狗
+// 平台实现: notify_windows.go (Windows) / notify_other.go (其他, 返回 nil)
+type deviceNotifier interface {
+	Changed() <-chan struct{}
+	Close()
+}
 
 // Monitor 后台持续读取 0x8110 按键位图, 支持自动重连与重新 startSpy
 type Monitor struct {
@@ -66,6 +98,9 @@ type Monitor struct {
 	pid    uint16
 
 	state atomic.Uint32
+
+	// notify 是设备插拔事件源 (nil 表示平台不支持, 退化为静默看门狗)
+	notify deviceNotifier
 
 	mu   sync.Mutex
 	dev  device
@@ -76,6 +111,13 @@ type Monitor struct {
 	devCursor int
 
 	events chan Event
+
+	// lastUnmatched 用于对未匹配报告做限流日志 (报告流可能很密)
+	lastUnmatched atomic.Int64
+	// firstReport 标记每条连接收到的第一个报告, 用于诊断设备是否在发报告
+	firstReport atomic.Bool
+	// lastReport 是最近一次收到报告的时间 (看门狗用, 仅 readLoop 单 goroutine 访问)
+	lastReport time.Time
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -101,6 +143,11 @@ func startWithPID(ctx context.Context, pid uint16) (*Monitor, error) {
 		events: make(chan Event, 256),
 		done:   make(chan struct{}),
 	}
+	if n, err := startNotifier(); err == nil {
+		m.notify = n
+	} else {
+		Logf("logihidpp: device notifier unavailable: %v (watchdog fallback)", err)
+	}
 	first := make(chan error, 1)
 	go m.run(first)
 	select {
@@ -123,12 +170,15 @@ func (m *Monitor) run(first chan<- error) {
 			first = nil
 		}
 		if err != nil {
+			Logf("logihidpp: connect failed: %v (retry in %v)", err, retryDelay)
 			if !m.wait(m.ctx, retryDelay) {
 				return
 			}
 			continue
 		}
+		Logf("logihidpp: connected to %s (0x8110 feature index %d)", m.DevicePath(), m.featureIndex())
 		if err := m.readLoop(); err != nil && m.ctx.Err() == nil {
+			Logf("logihidpp: read loop error: %v (reconnect in %v)", err, reconnectDelay)
 			m.clearState()
 			m.closeDev()
 			if !m.wait(m.ctx, reconnectDelay) {
@@ -136,6 +186,13 @@ func (m *Monitor) run(first chan<- error) {
 			}
 		}
 	}
+}
+
+// featureIndex 返回当前 0x8110 feature index (0 表示学习模式)
+func (m *Monitor) featureIndex() uint8 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.feat
 }
 
 func (m *Monitor) connectOnce() error {
@@ -163,8 +220,10 @@ func (m *Monitor) connectOnce() error {
 				devs[j].Close()
 			}
 		}
-		// startSpy 失败仍继续监听 (可能 GHub 已启用 spy)
-		_ = dev.StartSpy(m.ctx)
+		// startSpy 失败仍继续监听, 但设备可能保持静默 (无按键报告)
+		if err := dev.StartSpy(m.ctx); err != nil {
+			Logf("logihidpp: startSpy failed: %v (device may stay silent)", err)
+		}
 		m.mu.Lock()
 		m.dev = dev
 		m.feat = idx
@@ -201,19 +260,60 @@ func (m *Monitor) readLoop() error {
 		featCandidates = map[uint8]uint16{}
 		spySent        bool
 	)
+	m.firstReport.Store(false)
+	m.lastReport = time.Now()
+
+	// 设备插拔通知立即打断阻塞读, 不等 readPollInterval 轮询
+	// (接收器重枚举/休眠唤醒时旧连接可能永久静默)
+	loopCtx, loopCancel := context.WithCancel(m.ctx)
+	defer loopCancel()
+	if m.notify != nil {
+		go func() {
+			select {
+			case <-m.notify.Changed():
+				Logf("logihidpp: device change notification, interrupting read")
+				loopCancel()
+			case <-loopCtx.Done():
+			}
+		}()
+	}
+
 	for {
-		rctx := m.ctx
+		rctx := loopCtx
 		var cancel context.CancelFunc
 		if feat == 0 {
 			// 学习模式: 空设备无报告则超时, 触发重连轮换到下一个候选
-			rctx, cancel = context.WithTimeout(m.ctx, learnTimeout)
+			rctx, cancel = context.WithTimeout(loopCtx, learnTimeout)
+		} else {
+			// 看门狗: 阻塞读带检查间隔超时, 超时后检查首报告状态
+			rctx, cancel = context.WithTimeout(loopCtx, readPollInterval)
 		}
 		report, err := dev.ReadReport(rctx)
 		if cancel != nil {
 			cancel()
 		}
 		if err != nil {
-			return err
+			if m.ctx.Err() != nil {
+				return m.ctx.Err()
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				return err // 真实读取错误或通知打断, 触发重连
+			}
+			if feat == 0 {
+				return err // 学习模式超时: 轮换候选设备
+			}
+			// 首报告等待超时: 连接后从未收到任何报告则重连 (ghost 实例特征)
+			// 收到过报告后的空闲静默是 0x8110 正常状态, 不触发重连,
+			// 设备重枚举由 WM_DEVICECHANGE 事件 (notify) 打断
+			if !m.firstReport.Load() && time.Since(m.lastReport) > readIdleTimeout {
+				Logf("logihidpp: no reports within %v of connect, reconnecting", readIdleTimeout)
+				return err
+			}
+			continue
+		}
+		m.lastReport = time.Now()
+		if m.firstReport.CompareAndSwap(false, true) {
+			Logf("logihidpp: first report received: % X", report)
 		}
 		if feat == 0 {
 			fi, state, ok := sniffButtonReport(report)
@@ -252,6 +352,7 @@ func (m *Monitor) readLoop() error {
 		}
 		state, ok := ParseReport(report, feat)
 		if !ok {
+			m.logUnmatched(report)
 			continue
 		}
 		m.state.Store(uint32(state))
@@ -262,6 +363,18 @@ func (m *Monitor) readLoop() error {
 			}
 		}
 		prev = state
+	}
+}
+
+// logUnmatched 每秒最多记录一次未匹配报告, 用于排查报告格式/feature index 变化
+func (m *Monitor) logUnmatched(report []byte) {
+	now := time.Now().UnixMilli()
+	last := m.lastUnmatched.Load()
+	if now-last < 1000 {
+		return
+	}
+	if m.lastUnmatched.CompareAndSwap(last, now) {
+		Logf("logihidpp: unmatched report: % X", report)
 	}
 }
 
@@ -288,8 +401,19 @@ func (m *Monitor) DevicePath() string {
 // Close 关闭句柄并停止后台 goroutine
 func (m *Monitor) Close() error {
 	m.closeOnce.Do(m.cancel)
+	if m.notify != nil {
+		m.notify.Close()
+	}
 	<-m.done
 	return nil
+}
+
+// notifyChanged 返回设备插拔事件通道, 无通知源时为 nil (select 永久阻塞)
+func (m *Monitor) notifyChanged() <-chan struct{} {
+	if m.notify == nil {
+		return nil
+	}
+	return m.notify.Changed()
 }
 
 func (m *Monitor) closeDev() {
@@ -314,6 +438,10 @@ func (m *Monitor) wait(ctx context.Context, d time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	case <-t.C:
+		return true
+	case <-m.notifyChanged():
+		// 设备插拔事件: 提前结束等待, 立即重连
+		Logf("logihidpp: device change notification, reconnecting now")
 		return true
 	}
 }

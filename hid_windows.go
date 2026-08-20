@@ -313,17 +313,16 @@ func groupCandidates(cands []candidate) []deviceGroup {
 func deviceKey(path string) string {
 	p := strings.ToLower(path)
 	// 去掉集合序号段 (&colXX), 保留实例 ID
-	if i := strings.LastIndex(p, "&col"); i >= 0 {
-		if j := strings.Index(p[i:], "#"); j >= 0 {
-			p = p[:i] + p[i+j:]
+	if before, rest, found := strings.CutLast(p, "&col"); found {
+		if j := strings.Index(rest, "#"); j >= 0 {
+			p = before + rest[j:]
 		}
 	}
 	// 同一物理设备的多个集合实例 ID 尾段不同 (&0000/&0001),
 	// 去掉实例 ID 最后一个 & 段, 只保留设备实例主体
 	if i := strings.Index(p, "#"); i >= 0 {
-		tail := p[i+1:]
-		if j := strings.LastIndex(tail, "&"); j >= 0 {
-			p = p[:i+1+j]
+		if before, _, found := strings.CutLast(p[i+1:], "&"); found {
+			p = p[:i+1] + before
 		}
 	}
 	return p
@@ -484,6 +483,7 @@ func (d *hidDevice) FeatureIndex(ctx context.Context) (uint8, error) {
 		if rerr == nil {
 			if idx, perr := ParseFeatureIndex(reply); perr == nil {
 				d.featIdx = idx
+				Logf("logihidpp: getFeature via short (device 0xFF), index %d", idx)
 				return idx, nil
 			}
 		}
@@ -504,6 +504,7 @@ func (d *hidDevice) FeatureIndex(ctx context.Context) (uint8, error) {
 		}
 		if idx, perr := ParseFeatureIndexLong(reply); perr == nil {
 			d.featIdx = idx
+			Logf("logihidpp: getFeature via long (device 0x01), index %d", idx)
 			return idx, nil
 		}
 		// 队列里先到的可能是既有按键事件, 忽略并继续等应答
@@ -518,6 +519,7 @@ func (d *hidDevice) StartSpy(ctx context.Context) error {
 		reply, rerr := d.short.read(rctx)
 		cancel()
 		if rerr == nil && ParseStartSpyReply(reply, d.featIdx) == nil {
+			Logf("logihidpp: startSpy ok via short (device 0xFF)")
 			return nil
 		}
 	}
@@ -536,10 +538,54 @@ func (d *hidDevice) StartSpy(ctx context.Context) error {
 			return rerr
 		}
 		if ParseStartSpyReplyLong(reply, d.featIdx) == nil {
+			Logf("logihidpp: startSpy ok via long (device 0x01)")
 			return nil
 		}
 	}
 	return errors.New("logihidpp: startSpy timeout")
+}
+
+// FeatureList 通过 IRoot.getFeatureList (0x0000 func 0x02) 枚举设备全部 feature
+// 用于排查 0x8110 通知失效: 确认设备实际支持的按键 feature (如 0x1B04 ReprogControls)
+func (d *hidDevice) FeatureList(ctx context.Context) ([]FeatureInfo, error) {
+	var out []FeatureInfo
+	for start := 0; ; start += 4 {
+		req := []byte{
+			reportIDShort,
+			0x01, // Lightspeed 接收器设备号
+			featureIRoot,
+			funcGetFeatureList<<4 | swid,
+			byte(start),
+			0, 0,
+		}
+		if err := d.short.write(ctx, req); err != nil {
+			return nil, err
+		}
+		rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		reply, rerr := d.long.read(rctx)
+		cancel()
+		if rerr != nil {
+			return nil, rerr
+		}
+		if len(reply) < 6 || reply[0] != reportIDLong {
+			return nil, fmt.Errorf("logihidpp: bad feature list reply: % X", reply)
+		}
+		entries := 0
+		for i := 4; i+2 < len(reply); i += 3 {
+			idx := reply[i]
+			if idx == 0 {
+				return out, nil // 列表结束标记
+			}
+			out = append(out, FeatureInfo{
+				Index: idx,
+				ID:    uint16(reply[i+1])<<8 | uint16(reply[i+2]),
+			})
+			entries++
+		}
+		if entries < 4 {
+			return out, nil
+		}
+	}
 }
 
 func (d *hidDevice) ReadReport(ctx context.Context) ([]byte, error) {

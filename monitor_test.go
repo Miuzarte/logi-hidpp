@@ -338,3 +338,73 @@ func TestStartReturnsErrorAndRetries(t *testing.T) {
 		t.Fatalf("factory called %d times, want >= 2", calls.Load())
 	}
 }
+
+// fakeNotifier 模拟设备插拔通知源 (平台无关, 测试用)
+type fakeNotifier struct {
+	changed chan struct{}
+	closed  chan struct{}
+}
+
+func newFakeNotifier() *fakeNotifier {
+	return &fakeNotifier{changed: make(chan struct{}, 1), closed: make(chan struct{})}
+}
+
+func (f *fakeNotifier) Changed() <-chan struct{} {
+	return f.changed
+}
+
+func (f *fakeNotifier) Close() {
+	select {
+	case <-f.closed:
+	default:
+		close(f.closed)
+	}
+}
+
+func (f *fakeNotifier) fire() {
+	select {
+	case f.changed <- struct{}{}:
+	default:
+	}
+}
+
+// TestNotifyTriggersImmediateReconnect 验证: 收到设备插拔通知时立即重连,
+// 不等 readIdleTimeout 静默超时
+func TestNotifyTriggersImmediateReconnect(t *testing.T) {
+	withFastRetries(t)
+	// 拉长静默超时, 若没有通知机制, 重连只能靠超时 (测试会超时失败)
+	oldIdle := readIdleTimeout
+	readIdleTimeout = time.Minute
+	t.Cleanup(func() { readIdleTimeout = oldIdle })
+
+	fd1 := newFakeDevice(0x05)
+	fd2 := newFakeDevice(0x05)
+	var calls atomic.Int32
+	withFactory(t, func(ctx context.Context, pid uint16) ([]device, error) {
+		if calls.Add(1) == 1 {
+			return []device{fd1}, nil
+		}
+		return []device{fd2}, nil
+	})
+
+	notif := newFakeNotifier()
+	oldStart := startNotifier
+	startNotifier = func() (deviceNotifier, error) { return notif, nil }
+	t.Cleanup(func() { startNotifier = oldStart })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m, err := Start(ctx)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer m.Close()
+	waitStarted(t, fd1)
+
+	// 触发设备插拔事件
+	notif.fire()
+
+	// 立即重连: fd1 被关闭, fd2 被打开
+	waitClosed(t, fd1)
+	waitStarted(t, fd2)
+}
